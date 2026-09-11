@@ -2,6 +2,8 @@
 
 A real fruit-fly brain learns to blow the shofar. Rosh Hashanah 5787.
 
+![Shofar Fly](docs/shofar-fly.png)
+
 The brain is the FlyWire FAFB connectome (139,255 neurons, 2.7M synapses) simulated as leaky integrate-and-fire neurons in a Web Worker. A sound cue is played into the fly's ear neurons (Johnston's organ). The readout is the fly's own mouth motor neurons. Training uses dopamine-gated three-factor plasticity on the 1,231 excitatory synapses from the cue pathway onto the mouth motor neurons: synapses active while the mouth answers the sound get stronger when dopamine arrives.
 
 The shofar sound is driven only by the measured mouth motor spike rate in each trial. Untrained: about 3.6 spikes per tick, a sputter. Trained: about 5.2, a clean blast.

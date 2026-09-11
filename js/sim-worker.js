@@ -1,0 +1,636 @@
+/* LIF neuron simulator Web Worker — T7.3 + T7.7 (neuropil-gated)
+ *
+ * Leaky integrate-and-fire simulation over the full Drosophila connectome.
+ * Receives a binary connectome ArrayBuffer (optionally gzipped) on init.
+ *
+ * T7.7 optimizations:
+ * - Neuropil-gated simulation: only tick neurons in active groups,
+ *   lazy-activate groups when stimulation or synaptic input arrives.
+ * - SIMD-friendly memory layout: neurons physically reordered by group
+ *   so each group occupies a contiguous range in all typed arrays.
+ *   CSR matrix remapped to match. (struct-of-arrays, group-sorted)
+ * - Tick rate reduced to 10/sec; renderer interpolates brightness.
+ *
+ * Binary format (little-endian):
+ *   Header:   2 x uint32  -- neuron_count, edge_count
+ *   Edges:    edge_count x (uint32 pre, uint32 post, float32 weight), sorted by pre
+ *   Metadata: neuron_count x (uint8 region_type, uint16 group_id)
+ *
+ * Message protocol:
+ *   Main -> Worker: init, start, stop, stimulate, setStimulusState, setParams
+ *   Worker -> Main: ready, tick, stats, error
+ */
+
+/* ---------- constants ---------- */
+var DEFAULT_LEAK_RATE = 0.95;
+var DEFAULT_THRESHOLD = 1.0;
+var DEFAULT_REFRACTORY_PERIOD = 3;
+var WEIGHT_SCALE = 0.15;
+var TARGET_TICK_RATE = 10;
+var MIN_TICK_RATE = 5;
+var COOLDOWN_TICKS = 20;
+var STATS_INTERVAL = 20;
+
+/* ---------- module-level state ---------- */
+var N = 0;
+var edgeCount = 0;
+var V = null;               // Float32Array[N] voltage (group-sorted)
+var fired = null;            // Uint8Array[N] fire state (group-sorted)
+var refractory = null;       // Uint8Array[N] refractory counter (group-sorted)
+var rowPtr = null;           // Uint32Array[N+1] CSR row pointers (group-sorted)
+var colIdx = null;           // Uint32Array[edgeCount] CSR col indices (group-sorted)
+var values = null;           // Float32Array[edgeCount] CSR edge weights
+var originalValues = null;   // copy of values before any weight transform
+var regionType = null;       // Uint8Array[N] region per neuron (group-sorted)
+var groupId = null;          // Uint16Array[N] group per neuron (group-sorted)
+var leakRate = DEFAULT_LEAK_RATE;
+var threshold = DEFAULT_THRESHOLD;
+var refractoryPeriod = DEFAULT_REFRACTORY_PERIOD;
+var adaptInc = 0, adaptDecay = 0.97; // spike-frequency adaptation: threshold += adaptInc per spike, decays each tick
+var adapt = null;                    // Float32Array[N] adaptive threshold offset
+var running = false;
+var sustainedIndices = null;
+var sustainedIntensities = null;
+var tickCount = 0;
+var targetTickRate = TARGET_TICK_RATE;
+var stepping = false, stepGroups = null, stepMotor = null, stepI = 0;   // 'step' mode: run N ticks synchronously, report once
+var tickTimeSum = 0;
+var tickTimeSamples = 0;
+var activeNeuronCount = 0;
+var cumulativeFiredCount = 0;
+
+/* neuropil-gated simulation structures (built by buildGroupStructures) */
+var numGroups = 0;
+var groupOffset = null;          // Uint32Array[numGroups+1] prefix sum
+var groupActive = null;          // Uint8Array[numGroups]
+var groupCooldown = null;        // Uint8Array[numGroups]
+var groupRecvInput = null;       // Uint8Array[numGroups] per-tick scratch
+var groupFiredThisTick = null;   // Uint8Array[numGroups] per-tick scratch
+var groupStimulatedThisTick = null; // Uint8Array[numGroups] per-tick scratch
+
+/* ---------- dopamine-gated plasticity (three-factor rule) ----------
+ * Only existing excitatory synapses whose POST neuron sits in a chosen set of
+ * groups are plastic. dW = eta * preTrace[pre] * fired[post] * DA, where DA is a
+ * decaying trace of spikes in the dopamine groups. Weights are clamped to
+ * PLASTIC_MAX_GAIN x their original value. Nothing else in the wiring changes. */
+var plastic = null;              // {edges:Uint32Array, pre:Uint32Array, w0:Float32Array, isPre:Uint8Array, preList:Uint32Array}
+var preTrace = null;             // Float32Array[N] eligibility of presynaptic spikes
+var postTrace = null;            // Float32Array[N] eligibility of postsynaptic spikes
+var daTrace = 0;                 // dopamine level, decays each tick
+var daPulse = 0;                 // dopamine delivered as a modulatory signal this tick ('dopamine' message)
+var daGroups = null;             // Uint8Array[numGroups] flag: dopamine source
+var plasticEta = 0.003;
+var daFloor = 25, daScale = 100;   // dopamine spikes/tick below daFloor are background, not reward
+var PLASTIC_MAX_GAIN = 3.0;
+var PRE_TRACE_DECAY = 0.92;
+var DA_DECAY = 0.85;
+var plasticSumDelta = 0, plasticChanged = 0, plasticTotalW0 = 0;
+
+/* ---------- decompressGzip ---------- */
+
+async function decompressGzip(buffer) {
+	var ds = new DecompressionStream('gzip');
+	var writer = ds.writable.getWriter();
+	writer.write(new Uint8Array(buffer));
+	writer.close();
+	var reader = ds.readable.getReader();
+	var chunks = [];
+	while (true) {
+		var result = await reader.read();
+		if (result.done) break;
+		chunks.push(result.value);
+	}
+	var totalLen = 0;
+	for (var c = 0; c < chunks.length; c++) {
+		totalLen += chunks[c].byteLength;
+	}
+	var out = new Uint8Array(totalLen);
+	var offset = 0;
+	for (var c = 0; c < chunks.length; c++) {
+		out.set(chunks[c], offset);
+		offset += chunks[c].byteLength;
+	}
+	return out.buffer;
+}
+
+/* ---------- parseBinary ---------- */
+
+function parseBinary(buffer) {
+	var view = new DataView(buffer);
+	N = view.getUint32(0, true);
+	edgeCount = view.getUint32(4, true);
+
+	var edgeOffset = 8;
+	var metaOffset = edgeOffset + edgeCount * 12;
+
+	/* allocate CSR arrays (original index space, remapped later) */
+	rowPtr = new Uint32Array(N + 1);
+	colIdx = new Uint32Array(edgeCount);
+	values = new Float32Array(edgeCount);
+
+	/* first pass -- count outgoing edges per neuron */
+	for (var e = 0; e < edgeCount; e++) {
+		var pre = view.getUint32(edgeOffset + e * 12, true);
+		rowPtr[pre + 1]++;
+	}
+
+	/* prefix sum -- convert counts to cumulative offsets */
+	for (var i = 1; i <= N; i++) {
+		rowPtr[i] += rowPtr[i - 1];
+	}
+
+	/* second pass -- fill colIdx, values, find maxAbsWeight */
+	var maxAbsW = 0;
+	for (var e = 0; e < edgeCount; e++) {
+		var base = edgeOffset + e * 12;
+		colIdx[e] = view.getUint32(base + 4, true);
+		var rawW = view.getFloat32(base + 8, true);
+		values[e] = rawW;
+		var absW = rawW < 0 ? -rawW : rawW;
+		if (absW > maxAbsW) maxAbsW = absW;
+	}
+
+	/* normalize weights */
+	if (maxAbsW > 0) {
+		for (var e = 0; e < edgeCount; e++) {
+			values[e] = (values[e] / maxAbsW) * WEIGHT_SCALE;
+		}
+	}
+
+	/* read per-neuron metadata (original order) */
+	regionType = new Uint8Array(N);
+	groupId = new Uint16Array(N);
+	for (var i = 0; i < N; i++) {
+		regionType[i] = view.getUint8(metaOffset + i * 3);
+		groupId[i] = view.getUint16(metaOffset + i * 3 + 1, true);
+	}
+
+	/* allocate simulation state */
+	V = new Float32Array(N);
+	adapt = new Float32Array(N);
+	fired = new Uint8Array(N);
+	refractory = new Uint8Array(N);
+	tickCount = 0;
+}
+
+/* ---------- buildGroupStructures ---------- */
+/* Reorders all per-neuron arrays and the CSR matrix so neurons within each
+ * group occupy a contiguous range. Enables cache-friendly iteration over
+ * only active groups (neuropil gating) and SIMD-friendly memory access. */
+
+function buildGroupStructures() {
+	/* determine number of groups */
+	numGroups = 0;
+	for (var i = 0; i < N; i++) {
+		if (groupId[i] >= numGroups) numGroups = groupId[i] + 1;
+	}
+
+	/* count neurons per group */
+	var counts = new Uint32Array(numGroups);
+	for (var i = 0; i < N; i++) {
+		counts[groupId[i]]++;
+	}
+
+	/* build prefix-sum offsets */
+	groupOffset = new Uint32Array(numGroups + 1);
+	for (var g = 0; g < numGroups; g++) {
+		groupOffset[g + 1] = groupOffset[g] + counts[g];
+	}
+
+	/* build sortedByGroup: sortedByGroup[sorted_pos] = original_index */
+	var sortedByGroup = new Uint32Array(N);
+	var writePos = new Uint32Array(numGroups);
+	for (var g = 0; g < numGroups; g++) writePos[g] = groupOffset[g];
+	for (var i = 0; i < N; i++) {
+		var g = groupId[i];
+		sortedByGroup[writePos[g]++] = i;
+	}
+
+	/* reverse mapping: originalToSorted[original_index] = sorted_pos */
+	var originalToSorted = new Uint32Array(N);
+	for (var s = 0; s < N; s++) {
+		originalToSorted[sortedByGroup[s]] = s;
+	}
+
+	/* remap CSR to sorted index space */
+	var newRowPtr = new Uint32Array(N + 1);
+	for (var s = 0; s < N; s++) {
+		var o = sortedByGroup[s];
+		newRowPtr[s + 1] = rowPtr[o + 1] - rowPtr[o];
+	}
+	for (var s = 1; s <= N; s++) {
+		newRowPtr[s] += newRowPtr[s - 1];
+	}
+	var newColIdx = new Uint32Array(edgeCount);
+	var newValues = new Float32Array(edgeCount);
+	for (var s = 0; s < N; s++) {
+		var o = sortedByGroup[s];
+		var wp = newRowPtr[s];
+		for (var j = rowPtr[o]; j < rowPtr[o + 1]; j++) {
+			newColIdx[wp] = originalToSorted[colIdx[j]];
+			newValues[wp] = values[j];
+			wp++;
+		}
+	}
+	rowPtr = newRowPtr;
+	colIdx = newColIdx;
+	values = newValues;
+
+	/* remap per-neuron metadata to sorted order */
+	var newGroupId = new Uint16Array(N);
+	var newRegionType = new Uint8Array(N);
+	for (var s = 0; s < N; s++) {
+		newGroupId[s] = groupId[sortedByGroup[s]];
+		newRegionType[s] = regionType[sortedByGroup[s]];
+	}
+	groupId = newGroupId;
+	regionType = newRegionType;
+
+	/* V, fired, refractory are zero-initialized -- no remap needed */
+
+	/* allocate per-group activation state */
+	groupActive = new Uint8Array(numGroups);
+	groupCooldown = new Uint8Array(numGroups);
+	groupRecvInput = new Uint8Array(numGroups);
+	groupFiredThisTick = new Uint8Array(numGroups);
+	groupStimulatedThisTick = new Uint8Array(numGroups);
+}
+
+/* ---------- tick (neuropil-gated) ---------- */
+
+function tick() {
+	var t0 = performance.now();
+	var firedNeuronCount = 0;
+	var groupSpikeCounts = new Uint16Array(numGroups);
+
+	/* reset per-tick scratch */
+	groupRecvInput.fill(0);
+	groupFiredThisTick.fill(0);
+	groupStimulatedThisTick.fill(0);
+	activeNeuronCount = 0;
+
+	/* activate groups with sustained stimulation */
+	if (sustainedIndices) {
+		for (var k = 0; k < sustainedIndices.length; k++) {
+			var si = sustainedIndices[k];
+			if (si < N) {
+				var g = groupId[si];
+				groupStimulatedThisTick[g] = 1;
+				if (!groupActive[g]) {
+					groupActive[g] = 1;
+					groupCooldown[g] = COOLDOWN_TICKS;
+				}
+			}
+		}
+	}
+
+	/* step 1 -- decay V and refractory for active groups (contiguous access) */
+	for (var g = 0; g < numGroups; g++) {
+		if (!groupActive[g]) continue;
+		var start = groupOffset[g];
+		var end = groupOffset[g + 1];
+		activeNeuronCount += end - start;
+		for (var i = start; i < end; i++) {
+			if (refractory[i] > 0) {
+				refractory[i]--;
+				V[i] = 0;
+			} else {
+				V[i] *= leakRate;
+			}
+		}
+	}
+
+	/* step 1.5 -- apply sustained external stimulation */
+	if (sustainedIndices) {
+		for (var k = 0; k < sustainedIndices.length; k++) {
+			var si = sustainedIndices[k];
+			if (si < N && refractory[si] === 0) {
+				V[si] += sustainedIntensities[k];
+			}
+		}
+	}
+
+	/* step 2 -- propagate from fired neurons in active groups */
+	for (var g = 0; g < numGroups; g++) {
+		if (!groupActive[g]) continue;
+		for (var i = groupOffset[g]; i < groupOffset[g + 1]; i++) {
+			if (fired[i] === 0) continue;
+			for (var j = rowPtr[i]; j < rowPtr[i + 1]; j++) {
+				var target = colIdx[j];
+				V[target] += values[j];
+				groupRecvInput[groupId[target]] = 1;
+			}
+		}
+	}
+
+	/* activate groups that received synaptic input */
+	for (var g = 0; g < numGroups; g++) {
+		if (groupRecvInput[g] && !groupActive[g]) {
+			groupActive[g] = 1;
+			groupCooldown[g] = COOLDOWN_TICKS;
+		}
+	}
+
+	/* step 3 -- clear fired + threshold check for active groups */
+	for (var g = 0; g < numGroups; g++) {
+		if (!groupActive[g]) continue;
+		var start = groupOffset[g];
+		var end = groupOffset[g + 1];
+		for (var i = start; i < end; i++) {
+			fired[i] = 0;
+			if (adaptInc > 0) adapt[i] *= adaptDecay;
+			if (refractory[i] === 0 && V[i] >= threshold + adapt[i]) {
+				fired[i] = 1;
+				adapt[i] += adaptInc;
+				V[i] = 0;
+				refractory[i] = refractoryPeriod;
+				groupFiredThisTick[g] = 1;
+				groupSpikeCounts[g]++;
+				firedNeuronCount++;
+			}
+		}
+	}
+
+	/* step 3.5 -- dopamine-gated plasticity */
+	if (plastic) {
+		var daSpikes = 0;
+		for (var g = 0; g < numGroups; g++) {
+			if (daGroups[g]) daSpikes += groupSpikeCounts[g];
+		}
+		daTrace = daTrace * DA_DECAY + Math.min(1, Math.max(0, daSpikes - daFloor) / daScale) + daPulse; daPulse = 0;
+		var pl = plastic.preList;
+		for (var k = 0; k < pl.length; k++) {
+			var pi = pl[k];
+			preTrace[pi] = fired[pi] ? 1 : preTrace[pi] * PRE_TRACE_DECAY;
+		}
+		var pol = plastic.postList;
+		for (var k2 = 0; k2 < pol.length; k2++) {
+			var po = pol[k2];
+			postTrace[po] = fired[po] ? 1 : postTrace[po] * PRE_TRACE_DECAY;
+		}
+		if (daTrace > 0.02) {
+			var eg = plastic.edges, pr = plastic.pre, w0 = plastic.w0;
+			var scale = plasticEta * daTrace;
+			for (var q = 0; q < eg.length; q++) {
+				var post = colIdx[eg[q]];
+				var tr = preTrace[pr[q]] * postTrace[post];
+				if (tr < 0.01) continue;
+				var j = eg[q], maxW = w0[q] * PLASTIC_MAX_GAIN;
+				if (values[j] >= maxW) continue;
+				var d = scale * tr * w0[q];
+				var nw = values[j] + d;
+				if (nw > maxW) { d = maxW - values[j]; nw = maxW; }
+				values[j] = nw;
+				plasticSumDelta += d;
+				plasticChanged++;
+			}
+		}
+	}
+
+	/* update group cooldowns -- deactivate idle groups */
+	for (var g = 0; g < numGroups; g++) {
+		if (!groupActive[g]) continue;
+		if (groupFiredThisTick[g] || groupRecvInput[g] || groupStimulatedThisTick[g]) {
+			groupCooldown[g] = COOLDOWN_TICKS;
+		} else {
+			groupCooldown[g]--;
+			if (groupCooldown[g] <= 0) {
+				groupActive[g] = 0;
+				/* clear residual state for deactivated group */
+				var start = groupOffset[g];
+				var end = groupOffset[g + 1];
+				V.fill(0, start, end);
+				fired.fill(0, start, end);
+				refractory.fill(0, start, end);
+			}
+		}
+	}
+
+	if (stepping) {
+		var sm = 0; if (stepGroups) for (var sg = 0; sg < stepGroups.length; sg++) sm += groupSpikeCounts[stepGroups[sg]];
+		stepMotor[stepI++] = sm; tickCount++;
+		return;
+	}
+	/* post fire state to main thread */
+	self.postMessage({
+		type: 'tick',
+		fireState: fired,
+		firedNeurons: firedNeuronCount,
+		groupSpikeCounts: groupSpikeCounts,
+		tickCount: tickCount,
+		plasticity: plastic ? {edges: plastic.edges.length, sumDelta: plasticSumDelta, sumW0: plasticTotalW0, changed: plasticChanged, da: daTrace} : null
+	});
+	tickCount++;
+
+	/* performance stats */
+	var elapsed = performance.now() - t0;
+	tickTimeSum += elapsed;
+	tickTimeSamples++;
+	cumulativeFiredCount += firedNeuronCount;
+
+	if (tickTimeSamples >= STATS_INTERVAL) {
+		var avgMs = tickTimeSum / tickTimeSamples;
+		var avgFired = Math.round(cumulativeFiredCount / tickTimeSamples);
+		var activeGroups = 0;
+		for (var g = 0; g < numGroups; g++) {
+			if (groupActive[g]) activeGroups++;
+		}
+		self.postMessage({
+			type: 'stats',
+			avgTickMs: avgMs,
+			firedNeurons: avgFired,
+			activeNeurons: activeNeuronCount,
+			totalNeurons: N,
+			activeGroups: activeGroups,
+			totalGroups: numGroups,
+			tickRate: targetTickRate
+		});
+		tickTimeSum = 0;
+		tickTimeSamples = 0;
+		cumulativeFiredCount = 0;
+	}
+
+	/* schedule next tick at target rate */
+	if (running) {
+		var interval = Math.max(0, Math.floor(1000 / targetTickRate - elapsed));
+		setTimeout(tick, interval);
+	}
+}
+
+/* ---------- message handler ---------- */
+
+self.onmessage = function (e) {
+	switch (e.data.type) {
+
+	case 'init':
+		try {
+			var buffer = e.data.buffer;
+
+			function postReady() {
+				buildGroupStructures();
+				self.postMessage({type: 'ready', neuronCount: N, edgeCount: edgeCount,
+					groupId: groupId, regionType: regionType});
+			}
+
+			var header = new Uint8Array(buffer, 0, 2);
+			if (header[0] === 0x1f && header[1] === 0x8b) {
+				decompressGzip(buffer).then(function (raw) {
+					parseBinary(raw);
+					postReady();
+				}).catch(function (err) {
+					self.postMessage({type: 'error', message: 'Decompression failed: ' + err.message});
+				});
+				return;
+			}
+
+			parseBinary(buffer);
+			postReady();
+		} catch (err) {
+			self.postMessage({type: 'error', message: 'Init failed: ' + err.message});
+		}
+		break;
+
+	case 'start':
+		if (N === 0) {
+			self.postMessage({type: 'error', message: 'Cannot start: not initialized'});
+			return;
+		}
+		running = true;
+		setTimeout(tick, 0);
+		break;
+
+	case 'stop':
+		running = false;
+		break;
+
+	case 'stimulate':
+		var indices = e.data.indices;
+		var intensities = e.data.intensities;
+		for (var k = 0; k < indices.length; k++) {
+			var idx = indices[k];
+			if (idx < N) {
+				V[idx] += intensities[k];
+				/* activate target group for neuropil gating */
+				if (groupActive && !groupActive[groupId[idx]]) {
+					groupActive[groupId[idx]] = 1;
+					groupCooldown[groupId[idx]] = COOLDOWN_TICKS;
+				}
+			}
+		}
+		break;
+
+	case 'setStimulusState':
+		sustainedIndices = e.data.indices;
+		sustainedIntensities = e.data.intensities;
+		break;
+
+	case 'reset':
+		if (N === 0) break;
+		V.fill(0);
+		if (adapt) adapt.fill(0);
+		fired.fill(0);
+		refractory.fill(0);
+		sustainedIndices = null;
+		sustainedIntensities = null;
+		if (groupActive) {
+			groupActive.fill(0);
+			groupCooldown.fill(0);
+			groupRecvInput.fill(0);
+			groupFiredThisTick.fill(0);
+			groupStimulatedThisTick.fill(0);
+		}
+		tickTimeSum = 0;
+		tickTimeSamples = 0;
+		cumulativeFiredCount = 0;
+		activeNeuronCount = 0;
+		break;
+
+	case 'plasticity':
+		/* e.data.postGroups: group ids whose incoming excitatory synapses become plastic
+		 * e.data.daGroups: dopamine source group ids; e.data.eta optional */
+		if (N === 0) break;
+		if (e.data.enable === false) { plastic = null; break; }
+		if (e.data.eta !== undefined) plasticEta = e.data.eta;
+		if (e.data.daFloor !== undefined) daFloor = e.data.daFloor;
+		if (e.data.daScale !== undefined) daScale = e.data.daScale;
+		var postFlag = new Uint8Array(numGroups);
+		for (var a = 0; a < e.data.postGroups.length; a++) postFlag[e.data.postGroups[a]] = 1;
+		daGroups = new Uint8Array(numGroups);
+		for (var b = 0; b < e.data.daGroups.length; b++) daGroups[e.data.daGroups[b]] = 1;
+		var edgeFlag = null;   // e.data.edges: explicit plastic edge list (worker CSR indices), e.g. the offline trainer's set
+		if (e.data.edges) { edgeFlag = new Uint8Array(edgeCount); for (var q = 0; q < e.data.edges.length; q++) edgeFlag[e.data.edges[q]] = 1; }
+		var eList = [], pList = [], isPre = new Uint8Array(N);
+		for (var i = 0; i < N; i++) {
+			for (var j = rowPtr[i]; j < rowPtr[i + 1]; j++) {
+				if (edgeFlag ? edgeFlag[j] : (values[j] > 0 && postFlag[groupId[colIdx[j]]])) { eList.push(j); pList.push(i); isPre[i] = 1; }
+			}
+		}
+		var preList = [], postList = [], isPost = new Uint8Array(N);
+		for (var i2 = 0; i2 < N; i2++) if (isPre[i2]) preList.push(i2);
+		for (var c2 = 0; c2 < eList.length; c2++) isPost[colIdx[eList[c2]]] = 1;
+		for (var i3 = 0; i3 < N; i3++) if (isPost[i3]) postList.push(i3);
+		var w0 = new Float32Array(eList.length); plasticTotalW0 = 0;
+		for (var c = 0; c < eList.length; c++) { w0[c] = values[eList[c]]; plasticTotalW0 += w0[c]; }
+		plastic = {edges: Uint32Array.from(eList), pre: Uint32Array.from(pList), w0: w0, preList: Uint32Array.from(preList), postList: Uint32Array.from(postList)};
+		preTrace = new Float32Array(N); postTrace = new Float32Array(N); daTrace = 0; daPulse = 0; plasticSumDelta = 0; plasticChanged = 0;
+		self.postMessage({type: 'plasticityReady', edges: eList.length, preNeurons: preList.length});
+		break;
+
+	case 'fast':
+		/* step mode: the free-running loop stops; ticks happen only on 'step' requests */
+		if (e.data.on) { running = false; stepGroups = e.data.groups ? Uint32Array.from(e.data.groups) : null; }
+		else if (!running) { running = true; setTimeout(tick, 0); }
+		break;
+
+	case 'step':
+		/* run e.data.n ticks now; reply once with per-tick spike counts of stepGroups and the final fire state */
+		if (N === 0) break;
+		var sn = e.data.n | 0; stepMotor = new Float32Array(sn); stepI = 0; stepping = true;
+		for (var st = 0; st < sn; st++) tick();
+		stepping = false;
+		self.postMessage({ type: 'stepped', tag: e.data.tag, motor: stepMotor, fireState: fired, tickCount: tickCount,
+			plasticity: plastic ? {edges: plastic.edges.length, sumDelta: plasticSumDelta, sumW0: plasticTotalW0, changed: plasticChanged, da: daTrace} : null });
+		break;
+
+	case 'dopamine':
+		/* reward as a modulatory third factor: raises the dopamine trace without injecting spikes */
+		daPulse += e.data.amount || 0;
+		break;
+
+	case 'setWeightTransform':
+		/* w' = clamp(w * gain, -cap, cap): rescales normalized weights so typical synapses matter,
+		 * while a single giant synapse cannot exceed cap. Idempotent from the stored originals. */
+		if (N === 0) break;
+		if (!originalValues) originalValues = new Float32Array(values);
+		var wg = e.data.gain, wc = e.data.cap;
+		for (var wi = 0; wi < edgeCount; wi++) {
+			var wv = originalValues[wi] * wg;
+			values[wi] = wv > wc ? wc : (wv < -wc ? -wc : wv);
+		}
+		if (plastic) { for (var pw = 0; pw < plastic.w0.length; pw++) plastic.w0[pw] = values[plastic.edges[pw]]; plasticTotalW0 = 0; for (var pt = 0; pt < plastic.w0.length; pt++) plasticTotalW0 += plastic.w0[pt]; }
+		break;
+
+	case 'setWeights':
+		/* overwrite specific edges with learned values: e.data.edges Uint32Array, e.data.w Float32Array */
+		if (N === 0) break;
+		var se = e.data.edges, sw = e.data.w;
+		for (var si2 = 0; si2 < se.length; si2++) if (se[si2] < edgeCount) values[se[si2]] = sw[si2];
+		if (plastic) { for (var pw2 = 0; pw2 < plastic.w0.length; pw2++) plastic.w0[pw2] = values[plastic.edges[pw2]]; plasticSumDelta = 0; plasticChanged = 0; }
+		break;
+
+	case 'setGain':
+		/* multiply every synaptic weight (and plastic baselines) by e.data.factor */
+		if (N === 0) break;
+		for (var gi = 0; gi < edgeCount; gi++) values[gi] *= e.data.factor;
+		if (plastic) { for (var gw = 0; gw < plastic.w0.length; gw++) plastic.w0[gw] *= e.data.factor; plasticTotalW0 *= e.data.factor; }
+		break;
+
+	case 'setParams':
+		if (e.data.leakRate !== undefined) leakRate = e.data.leakRate;
+		if (e.data.threshold !== undefined) threshold = e.data.threshold;
+		if (e.data.refractoryPeriod !== undefined) refractoryPeriod = e.data.refractoryPeriod;
+		if (e.data.adaptInc !== undefined) adaptInc = e.data.adaptInc;
+		if (e.data.adaptDecay !== undefined) adaptDecay = e.data.adaptDecay;
+		break;
+	}
+};

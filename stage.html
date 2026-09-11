@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shofar Fly</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Frank+Ruhl+Libre:wght@500;700&family=IBM+Plex+Mono:wght@400;500&family=Heebo:wght@700;900&display=swap">
+<style>
+:root{--bg:#05070d;--panel:#0a0e18;--line:#1b2233;--text:#dfe4ee;--mute:#7d879b;--gold:#e0b04a;--gold2:#f3d489;--cyan:#6fd3ff;--ember:#e3734b}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px/1.4 "IBM Plex Mono",ui-monospace,Menlo,monospace;overflow:hidden}
+#stage{position:fixed;inset:0;display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
+#stage>section{position:relative;min-width:0}
+#flyPane{border-right:1px solid var(--line)}
+canvas.gl{position:absolute;inset:0;width:100%;height:100%;display:block}
+.hud{position:absolute;pointer-events:none;z-index:5}
+.hud.tl{top:18px;left:22px}.hud.tr{top:18px;right:22px;text-align:right}.hud.bl{bottom:20px;left:22px}.hud.br{bottom:20px;right:22px;text-align:right}
+.title{font:900 22px/1 Heebo,system-ui,sans-serif;letter-spacing:.14em;color:var(--gold)}
+.sub{color:var(--mute);margin-top:6px;font-size:11.5px}
+.sub b{color:var(--text);font-weight:500}
+.eyebrow{font-size:10.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--mute)}
+.big{font:500 22px/1.1 "IBM Plex Mono",monospace;color:var(--text);margin-top:4px;font-variant-numeric:tabular-nums}
+.big small{font-size:12px;color:var(--mute);margin-left:6px}
+#trainer{width:320px;background:rgba(10,14,24,.78);border:1px solid var(--line);border-radius:4px;padding:12px 14px;backdrop-filter:blur(6px)}
+#trainer .row{display:flex;justify-content:space-between;color:var(--mute);margin-top:8px;font-size:11.5px}
+#trainer .row b{color:var(--text);font-weight:500;font-variant-numeric:tabular-nums}
+.bar{height:5px;background:#161c2a;border-radius:2px;overflow:hidden;margin-top:4px}
+.bar i{display:block;height:100%;width:0;background:var(--gold);transition:width .35s}
+.bar.eff i{background:var(--ember);transition:width .12s}
+#stageHe{font:700 34px/1.1 "Frank Ruhl Libre",serif;color:var(--gold2)}
+#stageEn{color:var(--mute);font-size:11px;letter-spacing:.14em;text-transform:uppercase}
+#blast{position:absolute;left:50%;bottom:26%;transform:translateX(-50%);font:700 56px/1 "Frank Ruhl Libre",serif;color:#fff7e6;text-shadow:0 0 28px rgba(224,176,74,.9),0 0 90px rgba(224,176,74,.5);opacity:0;transition:opacity .2s;white-space:nowrap;z-index:6;pointer-events:none}
+#blast.on{opacity:1}
+#blast span{display:block;font:500 13px/1 "IBM Plex Mono",monospace;direction:ltr;color:var(--gold);letter-spacing:.3em;text-transform:uppercase;margin-top:12px;text-shadow:none;text-align:center}
+#raster{position:absolute;left:22px;right:22px;bottom:86px;height:54px;opacity:.9}
+#controls{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);display:flex;gap:8px;z-index:7}
+#controls button{font:500 11.5px "IBM Plex Mono",monospace;letter-spacing:.08em;color:var(--text);background:rgba(10,14,24,.85);border:1px solid var(--line);border-radius:3px;padding:7px 14px;cursor:pointer}
+#controls button:hover{border-color:var(--gold)}#controls button.on{background:var(--gold);color:#16120a;border-color:var(--gold)}
+#loading{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);z-index:20;transition:opacity .6s}
+#loading.hide{opacity:0;pointer-events:none}
+#loading .bar{width:280px}
+#connectomeSubtitle,#scaleIndicator{display:none}
+.wm{position:absolute;right:22px;bottom:20px;color:var(--mute);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase}
+</style>
+</head>
+<body>
+<div id="stage">
+  <section id="flyPane">
+    <canvas class="gl" id="flyCanvas"></canvas>
+    <div class="hud tl"><div class="title">SHOFAR FLY</div><div class="sub">a real fly brain learns to blow the shofar &nbsp;·&nbsp; Rosh Hashanah 5787</div></div>
+    <div class="hud bl" id="trainer">
+      <div id="stageHe">Sputter</div><div id="stageEn">next blast</div>
+      <div class="row"><span id="tAttempt">attempt 0</span><span hidden id="tSkill"></span></div><i hidden id="tSkillBar"></i>
+      <div class="row"><span id="tPhase">press S to train</span></div>
+      <span hidden id="tSyn"></span><span hidden id="regime"></span><i hidden id="tEffort"></i>
+    </div>
+    <div id="blast"></div>
+    <div id="controls">
+      <button id="btnTrain">S&nbsp; train from scratch</button><button id="btnPerform">B&nbsp; blow</button><button id="btnTrained" hidden onclick="window.Shofar.toggleTrained()"></button><button id="btnBlow" hidden></button><button id="btnReset" hidden></button>
+    </div>
+  </section>
+  <section id="brainPane">
+    <canvas class="gl" id="brainCanvas"></canvas>
+    <div class="hud tl"><div class="eyebrow">Fly brain · live</div><div class="big" id="nCount">139,255 neurons</div><div class="sub"><b>2.7M</b> synapses · FlyWire connectome</div><div class="sub" id="brainState">loading…</div></div>
+    <div class="hud tr"><div class="eyebrow">Spikes / s</div><div class="big" id="spikeRate">0</div><div class="sub" id="cueState" style="color:var(--gold);min-height:16px"></div></div>
+    <canvas id="raster"></canvas>
+    <div class="wm">sound &rarr; ear neurons · reward &rarr; dopamine · mouth motor neurons &rarr; shofar</div>
+  </section>
+</div>
+<div id="loading"><div class="title">SHOFAR FLY</div><div class="sub" id="loadText">loading 139,255-neuron connectome…</div><div class="bar"><i id="loadBar"></i></div></div>
+<span id="connectomeSubtitle"></span><span id="scaleIndicator"></span>
+
+<script src="js/vendor/three.min.js"></script>
+<script src="js/vendor/OrbitControls.js"></script>
+<script src="js/constants.js?v=17"></script>
+<script src="js/connectome.js?v=17"></script>
+<script src="js/brain-worker-bridge.js?v=23"></script>
+<script src="js/fly-logic.js?v=17"></script>
+<script src="js/stage.js?v=43"></script>
+</body>
+</html>

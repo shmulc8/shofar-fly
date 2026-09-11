@@ -1,0 +1,32 @@
+{
+ "gain": 150.0,
+ "cap": 0.6,
+ "eta": 0.002,
+ "trials": 200,
+ "baseline": 20,
+ "test": 20,
+ "edges": 1231,
+ "device": "mps",
+ "evoked_base": 3.5999999046325684,
+ "evoked_test": 5.599999904632568,
+ "recruited_base": 48.0,
+ "recruited_test": 52.0,
+ "dW_percent": 112.32492350519794,
+ "da0": 0.0,
+ "da_mode": "signal",
+ "da_signal": 1.0,
+ "da_amp": 2.7,
+ "da_tick": 12,
+ "min_gain": 0.25,
+ "adapt_inc": 1.0,
+ "adapt_decay": 0.97,
+ "no_tonic": true,
+ "jo_int": 0.44999999999999996,
+ "reset_between": true,
+ "plastic_post": [
+  "SEZ_FEED",
+  "MN_PROBOSCIS",
+  "MN_HEAD"
+ ],
+ "cue_path": true
+}
